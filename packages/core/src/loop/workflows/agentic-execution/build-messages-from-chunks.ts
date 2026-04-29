@@ -45,6 +45,10 @@ export function buildMessagesFromChunks({
 }): MastraDBMessage[] {
   const parts: MastraMessagePart[] = [];
 
+  // Track order of each emitted part for correct stream ordering.
+  const partOrderMap = new Map<MastraMessagePart, number>();
+  let spanOrderCounter = 1;
+
   // Collect tool results so we can match them to tool calls
   const toolResults = new Map<
     string,
@@ -64,12 +68,15 @@ export function buildMessagesFromChunks({
   }
 
   // State for text span accumulation (keyed by text ID to handle interleaved spans)
-  const textSpans = new Map<string, { deltas: string[]; providerMetadata: Record<string, any> | undefined }>();
+  const textSpans = new Map<
+    string,
+    { deltas: string[]; providerMetadata: Record<string, any> | undefined; order: number }
+  >();
 
   // State for reasoning span accumulation (keyed by reasoning ID)
   const reasoningSpans = new Map<
     string,
-    { deltas: string[]; providerMetadata: Record<string, any> | undefined; redacted: boolean }
+    { deltas: string[]; providerMetadata: Record<string, any> | undefined; redacted: boolean; order: number }
   >();
   for (const chunk of chunks) {
     switch (chunk.type) {
@@ -80,6 +87,7 @@ export function buildMessagesFromChunks({
           textSpans.set(p.id, {
             deltas: [],
             providerMetadata: p.providerMetadata,
+            order: 0,
           });
         } else {
           // Update providerMetadata if this start has it
@@ -95,8 +103,11 @@ export function buildMessagesFromChunks({
         let span = textSpans.get(p.id);
         // Auto-create span if delta arrives without a matching text-start
         if (!span) {
-          span = { deltas: [], providerMetadata: p.providerMetadata };
+          span = { deltas: [], providerMetadata: p.providerMetadata, order: spanOrderCounter++ };
           textSpans.set(p.id, span);
+        } else {
+          // Update last-seen delta order for the span it belongs
+          span.order = spanOrderCounter++;
         }
         span.deltas.push(p.text);
         // AI SDK semantics: latest non-null providerMetadata wins
@@ -116,11 +127,14 @@ export function buildMessagesFromChunks({
           const text = span.deltas.join('');
           // Only emit a part if there's actual content — skip empty text spans
           if (text.length > 0) {
-            parts.push({
+            const part = {
               type: 'text' as const,
               text,
               ...(span.providerMetadata ? { providerMetadata: span.providerMetadata } : {}),
-            } as MastraMessagePart);
+            } as MastraMessagePart;
+            parts.push(part);
+            // Use last-seen delta order, would be skipped if no delta (empty text span)
+            partOrderMap.set(part, span.order);
           }
           textSpans.delete(pEnd.id);
         }
@@ -138,6 +152,7 @@ export function buildMessagesFromChunks({
             deltas: [],
             providerMetadata: p.providerMetadata,
             redacted: isRedacted,
+            order: spanOrderCounter++,
           });
         } else {
           // Update providerMetadata if this start has it
@@ -156,7 +171,7 @@ export function buildMessagesFromChunks({
         let span = reasoningSpans.get(p.id);
         // Auto-create span if delta arrives without a matching reasoning-start
         if (!span) {
-          span = { deltas: [], providerMetadata: p.providerMetadata, redacted: false };
+          span = { deltas: [], providerMetadata: p.providerMetadata, redacted: false, order: spanOrderCounter++ };
           reasoningSpans.set(p.id, span);
         }
         span.deltas.push(p.text);
@@ -175,23 +190,24 @@ export function buildMessagesFromChunks({
             span.providerMetadata = p.providerMetadata;
           }
 
-          if (span.redacted) {
-            parts.push({
-              type: 'reasoning' as const,
-              reasoning: '',
-              details: [{ type: 'redacted', data: '' }],
-              providerMetadata: span.providerMetadata,
-            } as MastraMessagePart);
-          } else {
-            // Always emit reasoning parts, even if empty — OpenAI requires item_reference
-            // for tool calls that follow reasoning. See: https://github.com/mastra-ai/mastra/issues/9005
-            parts.push({
-              type: 'reasoning' as const,
-              reasoning: '',
-              details: [{ type: 'text', text: span.deltas.join('') }],
-              providerMetadata: span.providerMetadata,
-            } as MastraMessagePart);
-          }
+          const part = span.redacted
+            ? ({
+                type: 'reasoning' as const,
+                reasoning: '',
+                details: [{ type: 'redacted', data: '' }],
+                providerMetadata: span.providerMetadata,
+              } as MastraMessagePart)
+            : ({
+                // Always emit reasoning parts, even if empty — OpenAI requires item_reference
+                // for tool calls that follow reasoning. See: https://github.com/mastra-ai/mastra/issues/9005
+                type: 'reasoning' as const,
+                reasoning: '',
+                details: [{ type: 'text', text: span.deltas.join('') }],
+                providerMetadata: span.providerMetadata,
+              } as MastraMessagePart);
+          parts.push(part);
+          // Use span start order
+          partOrderMap.set(part, span.order);
 
           reasoningSpans.delete(p.id);
         }
@@ -201,19 +217,21 @@ export function buildMessagesFromChunks({
       // Redacted reasoning can appear as a standalone chunk (not wrapped in start/end)
       case 'redacted-reasoning': {
         const p = chunk.payload as { id: string; data: unknown; providerMetadata?: Record<string, any> };
-        parts.push({
+        const part = {
           type: 'reasoning' as const,
           reasoning: '',
           details: [{ type: 'redacted', data: '' }],
           providerMetadata: p.providerMetadata,
-        } as MastraMessagePart);
+        } as MastraMessagePart;
+        parts.push(part);
+        partOrderMap.set(part, spanOrderCounter++);
         break;
       }
 
       // ── Source ──────────────────────────────────────────────────
       case 'source': {
         const p = chunk.payload as SourcePayload;
-        parts.push({
+        const part = {
           type: 'source',
           source: {
             sourceType: 'url',
@@ -222,19 +240,23 @@ export function buildMessagesFromChunks({
             title: p.title,
             providerMetadata: p.providerMetadata,
           },
-        } as MastraMessagePart);
+        } as MastraMessagePart;
+        parts.push(part);
+        partOrderMap.set(part, spanOrderCounter++);
         break;
       }
 
       // ── File ───────────────────────────────────────────────────
       case 'file': {
         const p = chunk.payload as FilePayload;
-        parts.push({
+        const part = {
           type: 'file' as const,
           data: p.data,
           mimeType: p.mimeType,
           ...(p.providerMetadata ? { providerMetadata: p.providerMetadata } : {}),
-        } as MastraMessagePart);
+        } as MastraMessagePart;
+        parts.push(part);
+        partOrderMap.set(part, spanOrderCounter++);
         break;
       }
 
@@ -247,35 +269,33 @@ export function buildMessagesFromChunks({
         // Check if we have a matching result from a provider-executed tool
         const result = toolResults.get(p.toolCallId);
 
-        if (result) {
-          // Merge call + result into a single 'result' state part
-          const resultProviderExecuted = inferProviderExecuted(result.providerExecuted, toolDef);
-          parts.push({
-            type: 'tool-invocation' as const,
-            toolInvocation: {
-              state: 'result' as const,
-              toolCallId: p.toolCallId,
-              toolName: p.toolName,
-              args: p.args,
-              result: result.result,
-            },
-            providerMetadata: result.providerMetadata ?? p.providerMetadata,
-            providerExecuted: resultProviderExecuted,
-          } as MastraMessagePart);
-        } else {
-          // No result yet — emit as 'call' state
-          parts.push({
-            type: 'tool-invocation' as const,
-            toolInvocation: {
-              state: 'call' as const,
-              toolCallId: p.toolCallId,
-              toolName: p.toolName,
-              args: p.args,
-            },
-            providerMetadata: p.providerMetadata,
-            providerExecuted,
-          } as MastraMessagePart);
-        }
+        const part =
+          result && result.result != null
+            ? ({
+                type: 'tool-invocation' as const,
+                toolInvocation: {
+                  state: 'result' as const,
+                  toolCallId: p.toolCallId,
+                  toolName: p.toolName,
+                  args: p.args,
+                  result: result.result,
+                },
+                providerMetadata: result.providerMetadata ?? p.providerMetadata,
+                providerExecuted: inferProviderExecuted(result.providerExecuted, toolDef),
+              } as MastraMessagePart)
+            : ({
+                type: 'tool-invocation' as const,
+                toolInvocation: {
+                  state: 'call' as const,
+                  toolCallId: p.toolCallId,
+                  toolName: p.toolName,
+                  args: p.args,
+                },
+                providerMetadata: p.providerMetadata,
+                providerExecuted,
+              } as MastraMessagePart);
+        parts.push(part);
+        partOrderMap.set(part, spanOrderCounter++);
         break;
       }
 
@@ -288,35 +308,48 @@ export function buildMessagesFromChunks({
 
   // Flush any unclosed reasoning spans (stream ended without reasoning-end)
   for (const [_id, span] of reasoningSpans) {
-    if (span.redacted) {
-      parts.push({
-        type: 'reasoning' as const,
-        reasoning: '',
-        details: [{ type: 'redacted', data: '' }],
-        providerMetadata: span.providerMetadata,
-      } as MastraMessagePart);
-    } else {
-      const text = span.deltas.join('');
-      parts.push({
-        type: 'reasoning' as const,
-        reasoning: '',
-        details: [{ type: 'text', text }],
-        providerMetadata: span.providerMetadata,
-      } as MastraMessagePart);
-    }
+    const part = span.redacted
+      ? ({
+          type: 'reasoning' as const,
+          reasoning: '',
+          details: [{ type: 'redacted', data: '' }],
+          providerMetadata: span.providerMetadata,
+        } as MastraMessagePart)
+      : ({
+          type: 'reasoning' as const,
+          reasoning: '',
+          details: [{ type: 'text', text: span.deltas.join('') }],
+          providerMetadata: span.providerMetadata,
+        } as MastraMessagePart);
+    parts.push(part);
+    // Use recorded span start order for reasoning spans
+    partOrderMap.set(part, span.order);
   }
 
   // Flush any unclosed text spans (stream ended without text-end)
   for (const [, span] of textSpans) {
     const text = span.deltas.join('');
     if (text.length > 0) {
-      parts.push({
+      const part = {
         type: 'text' as const,
         text,
         ...(span.providerMetadata ? { providerMetadata: span.providerMetadata } : {}),
-      } as MastraMessagePart);
+      } as MastraMessagePart;
+      parts.push(part);
+      // Use last-seen delta order, would be skipped if no delta (empty text span)
+      partOrderMap.set(part, span.order);
     }
   }
+
+  // Sort parts by type-aware ordering:
+  // text spans use last-seen-delta, skipped if no delta received
+  // reasoning spans use span start, redacted-reasoning and other types use order of the standalone span.
+  parts.sort((a, b) => {
+    const orderA = partOrderMap.get(a);
+    const orderB = partOrderMap.get(b);
+    // Both should always have an order entry, but fall back to 0
+    return (orderA ?? 0) - (orderB ?? 0);
+  });
 
   // Insert step-start markers between tool-invocation and subsequent text parts.
   // This matches the convention used by MessageMerger.pushNewPart when merging messages,
