@@ -1,5 +1,6 @@
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
+import { createOllama } from 'ollama-ai-provider-v2';
 import type { HarnessRequestContext } from '@mastra/core/harness';
 import { GATEWAY_AUTH_HEADER, MastraGateway, ModelRouterLanguageModel } from '@mastra/core/llm';
 import type { RequestContext } from '@mastra/core/request-context';
@@ -24,6 +25,7 @@ import type { ThinkingLevel } from '../providers/openai-codex.js';
 const authStorage = new AuthStorage();
 
 const OPENAI_PREFIX = 'openai/';
+const OLLAMA_PREFIX = 'ollama/';
 const MASTRA_GATEWAY_PREFIX = 'mastra/';
 
 const CODEX_OPENAI_MODEL_REMAPS: Record<string, string> = {
@@ -135,6 +137,8 @@ function openaiApiKeyProvider(modelId: string, apiKey: string, headers?: ModelRe
   });
 }
 
+let ollamaFetch: typeof globalThis.fetch | undefined;
+
 /**
  * Resolve a model ID to the correct provider instance.
  * Shared by the main agent, observer, and reflector.
@@ -241,8 +245,44 @@ export function resolveModel(
   const isAnthropicModel = normalizedModelId.startsWith('anthropic/');
   const isOpenAIModel = normalizedModelId.startsWith(OPENAI_PREFIX);
   const isMoonshotModel = normalizedModelId.startsWith('moonshotai/');
+  const isOllamaModel = normalizedModelId.startsWith(OLLAMA_PREFIX);
 
-  if (isMoonshotModel) {
+  if (isOllamaModel) {
+    if (!ollamaFetch) {
+      // Node stores the global dispatcher in a symbol
+      const globalDispatcher = (globalThis as any)[Symbol.for('undici.globalDispatcher.1')];
+      
+      // Use the same constructor to create a custom one with new settings
+      const dispatcher = new globalDispatcher.constructor({
+        headersTimeout: 0,
+        bodyTimeout: 0
+      });
+
+      // Create a custom fetch for ollama to avoid client side request timeout (300_000ms)
+      ollamaFetch = (
+        input: Parameters<typeof globalThis.fetch>[0], 
+        init?: Parameters<typeof globalThis.fetch>[1]
+      ) => fetch(input, { ...init, dispatcher });
+    }
+
+    return wrapLanguageModel({
+      model: createOllama({ fetch: ollamaFetch })(normalizedModelId.substring(OLLAMA_PREFIX.length)),
+      middleware: [{
+        specificationVersion: 'v3',
+        transformParams: async ({ params }) => {
+          params.providerOptions = {
+              ...params.providerOptions,
+              ollama: {
+                think: options?.thinkingLevel !== 'off',
+                ...params.providerOptions?.ollama,
+              },
+            } as typeof params.providerOptions;
+
+          return params;
+        },
+      }],
+    });
+  } else if (isMoonshotModel) {
     if (!process.env.MOONSHOT_AI_API_KEY) {
       throw new Error(`Need MOONSHOT_AI_API_KEY`);
     }
